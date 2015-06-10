@@ -1,7 +1,16 @@
+import base64
+import hmac
 import json
 import requests
 import time
 import urllib
+import os
+from random import randrange
+from decimal import Decimal
+
+from hashlib import sha1, md5
+import logging
+#logging.basicConfig(level=logging.DEBUG)
 
 def parse_time(timestr):
     format = "%Y-%m-%d %H:%M:%S"
@@ -15,6 +24,19 @@ class Location:
             delta = "0.030000"
         self.delta = delta
 
+    def __str__(self):
+        return "Location(%s, %s)" % (self.latitude, self.longitude)
+
+class PeekLocation:
+    def __init__(self, raw):
+        self.id = raw['peekID']
+        self.can_submit = bool(raw['canSubmit'])
+        self.name = raw['location']
+        lat = raw['latitude']
+        lon = raw['longitude']
+        d = raw['delta']
+        self.location = Location(lat, lon, d)
+
 class Comment:
     def __init__(self, raw, message_id, client):
         self.client = client
@@ -25,6 +47,8 @@ class Comment:
         self.likes = int(raw["numberOfLikes"])
         self.poster_id = raw["posterID"]
         self.liked = int(raw["liked"])
+
+        self.message_id = self.message_id.replace('\\', '')
 
     def upvote(self):
         if self.liked == 0:
@@ -61,7 +85,6 @@ class Yak:
         self.client = client
         self.poster_id = raw["posterID"]
         self.hide_pin = bool(int(raw["hidePin"]))
-        self.handle = raw["handle"]
         self.message_id = raw["messageID"]
         self.delivery_id = raw["deliveryID"]
         self.longitude = raw["longitude"]
@@ -73,6 +96,15 @@ class Yak:
         self.type = raw["type"]
         self.liked = int(raw["liked"])
         self.reyaked = raw["reyaked"]
+
+        #Yaks don't always have a handle
+        try:
+            self.handle = raw["handle"]
+        except KeyError:
+            self.handle = None
+
+        #For some reason this seems necessary
+        self.message_id = self.message_id.replace('\\', '')
 
     def upvote(self):
         if self.liked == 0:
@@ -106,34 +138,120 @@ class Yak:
         print "%s likes, %s comments. posted %s at %s %s" % (self.likes, self.comments, self.time, self.latitude, self.longitude)
 
 class Yakker:
-    base_url = "http://www.yikyakapp.com/YikYakFiles/"
-    user_agent = "android-async-http/1.4.4 (http://loopj.com/android-async-http)"
-    
-    def __init__(self, user_id=None):
+    base_url = "https://us-east-api.yikyakapi.net/api/"
+    user_agent = "Dalvik/1.6.0 (Linux; U; Android 4.4.4; XT1060 Build/KXA21.12-L1.26)"
+    cookie = None
+
+    def __init__(self, user_id=None, location=None, force_register=False):
+        if location is None:
+            location = Location('0', '0')
+        self.update_location(location)
+
         if user_id is None:
-            user_id = self.register_id()
-        
+            user_id = self.gen_id()
+            self.register_id_new(user_id)
+        elif force_register:
+            self.register_id_new(user_id)
+
         self.id = user_id
-        self.location = Location("0", "0")
+
         self.handle = None
 
         #self.update_stats()
-        
+
+    def gen_id(self):
+        return md5(os.urandom(128)).hexdigest().upper()
+
+    def register_id_new(self, id):
+        params = {
+            "userID": id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
+        }
+        result = self.get("registerUser", params)
+        #print result.headers
+        #print("Register: {}".format(result))
+        return result
+
+    def sign_request(self, page, params):
+
+        #key obtained using ddi
+        key = "EF64523D2BD1FA21F18F5BC654DFC41B"
+
+        #The salt is just the current time in seconds since epoch
+        salt = str(int(time.time()))
+
+        #The message to be signed is essentially the request, with parameters sorted
+        msg = "/api/" + page
+        sorted_params = params.keys()
+        sorted_params.sort()
+        if len(params) > 0:
+            msg += "?"
+        for param in sorted_params:
+            msg += "%s=%s&" % (param, params[param])
+        #Chop off last "&"
+        if len(params) > 0:
+            msg = msg[:-1]
+
+        #the salt is just appended directly
+        msg += salt
+
+        #Calculate the signature
+        h = hmac.new(key, msg, sha1)
+        hash = base64.b64encode(h.digest())
+
+        return hash, salt, msg
+
+
     def get(self, page, params):
         url = self.base_url + page
-        if len(params) > 0:
-            url += "?" + urllib.urlencode(params)
-        
+
+        params['version'] = "2.1.001"
+        hash, salt, msg = self.sign_request(page, params)
+        params['salt'] = salt
+        params['hash'] = hash
+
+
         headers = {
             "User-Agent": self.user_agent,
             "Accept-Encoding": "gzip",
         }
-        
-        return requests.get(url, headers=headers)
+
+        if self.cookie is not None:
+            headers["Cookie"] = self.cookie
+        ret = requests.get(url, params=params, headers=headers)
+        if self.cookie is None:
+            self.cookie = ret.headers["Set-Cookie"].split(';')[0]
+        return ret
+
+    def post(self, page, params):
+        url = self.base_url + page
+
+        getparams = { 'userID': self.id, "version": "2.1.001" }
+        hash, salt, msg = self.sign_request(page, getparams)
+        getparams['salt'] = salt
+        getparams['hash'] = hash
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent": self.user_agent,
+            "Accept-Encoding": "gzip",
+            "Cookie": self.cookie
+        }
+        data = ""
+        sorted_params = params.keys()
+        sorted_params.sort()
+        for param in sorted_params:
+            data += "%s=%s&" % (param, params[param])
+        ret = requests.post(url, data=data, params=getparams, headers=headers)
+        return ret
+
+    def calc_accuracy(self): #needed in 2.6.3
+        return format(Decimal(randrange(10000))/1000 % 30 + 20, ".3f")
 
     def get_yak_list(self, page, params):
         return self.parse_yaks(self.get(page, params).text)
-        
+
     def parse_yaks(self, text):
         try:
             raw_yaks = json.loads(text)["messages"]
@@ -159,185 +277,208 @@ class Yakker:
             "userID": self.id,
             "message": message
         }
-        return self.get("contactUs.php", params)
+        return self.get("contactUs", params)
 
     def upvote_yak(self, message_id):
         params = {
             "userID": self.id,
-            "messageID": message_id
+            "messageID": message_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("likeMessage.php", params)
+        return self.get("likeMessage", params)
 
     def downvote_yak(self, message_id):
         params = {
             "userID": self.id,
-            "messageID": message_id
+            "messageID": message_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("downvoteMessage.php", params)
+        return self.get("downvoteMessage", params)
 
     def upvote_comment(self, comment_id):
         params = {
             "userID": self.id,
-            "commentID": comment_id
+            "commentID": comment_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("likeComment.php", params)
+        return self.get("likeComment", params)
 
     def downvote_comment(self, comment_id):
         params = {
             "userID": self.id,
-            "commentID": comment_id
+            "commentID": comment_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("downvoteComment.php", params)
+        return self.get("downvoteComment", params)
 
     def report_yak(self, message_id):
         params = params = {
             "userID": self.id,
-            "messageID": message_id
+            "messageID": message_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("reportMessage.php", params)
+        return self.get("reportMessage", params)
 
     def delete_yak(self, message_id):
         params = params = {
             "userID": self.id,
-            "messageID": message_id
+            "messageID": message_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("deleteMessage2.php", params)
+        return self.get("deleteMessage2", params)
 
     def report_comment(self, comment_id, message_id):
         params = {
             "userID": self.id,
             "commentID": comment_id,
             "messageID": message_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("reportMessage.php", params)
+        return self.get("reportMessage", params)
 
     def delete_comment(self, comment_id, message_id):
         params = {
             "userID": self.id,
             "commentID": comment_id,
             "messageID": message_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("deleteComment.php", params)
+        return self.get("deleteComment", params)
 
-    def update_handle(self, handle):
-        success = False 
-        if handle != self.handle:
-            self.handle = handle
-            params = {
-                "userID": self.id,
-                "handle": self.handle
-            }
-            success = bool(self.get("updateHandle.php", params) == "0")
-
-        return success
-
-    def get_handle_info(self):
-        params = {
-            "userID": self.id,
-        }
-        return self.get("getHandleInfo.php", params).text
-
-    def update_stats(self):
-        params = {
-            "userID": self.id,
-        }
-        stats = self.get("getMyStats.php", params).text.split()
-        #TODO: fix this for real...
-        try:
-            self.num_messages = int(stats[0])
-            self.neg3 = int(stats[1])
-            self.upvotes_given = int(stats[2])
-            self.downvotes_given = int(stats[3])
-            self.yak_score = int(stats[4])
-        except IndexError:
-            pass
-        
     def get_greatest(self):
-        return self.get_yak_list("getGreatest.php", {})
-        
+        params = {
+            "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
+        }
+        return self.get_yak_list("getGreatest", params)
+
     def get_my_tops(self):
         params = {
             "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get_yak_list("getMyTops.php", params)
-        
+        return self.get_yak_list("getMyTops", params)
+
     def get_recent_replied(self):
         params = {
             "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get_yak_list("getMyRecentReplied.php", params)
-        
-    def update_location(self, location):
-        self.loc = location
-        params = {
-            "userID": self.id,
-            "lat": location.latitude,
-            "long": location.longitude,
-        }
+        return self.get_yak_list("getMyRecentReplies", params)
 
-        return self.get("updateLocation.php", params)
-        
+    def update_location(self, location):
+        self.location = location
+
     def get_my_recent_yaks(self):
         params = {
             "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get_yak_list("getMyRecentYaks.php", params)
-        
-    def get_area_tops(self, loc=None):
-        if loc is None:
-            loc = self.location
+        return self.get_yak_list("getMyRecentYaks", params)
+
+    def get_area_tops(self):
         params = {
-            "lat": loc.latitude,
-            "long": loc.longitude,
+            "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get_yak_list("getAreaTops.php", params)
-    
+        return self.get_yak_list("getAreaTops", params)
+
     def get_yaks(self):
         params = {
             "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get_yak_list("getMessages.php", params)
-    
-    def post_yak(self, message, loc=None, showloc=False, handle=False):
-        if loc is None:
-            loc = self.location
+        return self.get_yak_list("getMessages", params)
+
+    def post_yak(self, message, showloc=False, handle=False):
         params = {
             "userID": self.id,
-            "lat": loc.latitude,
-            "long": loc.longitude,
-            "message": message,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
+            "message": message.replace(" ", "+"),
         }
         if not showloc:
             params["hidePin"] = "1"
         if handle and (self.handle is not None):
             params["hndl"] = self.handle
-        return self.get("sendMessage.php", params)
+        return self.post("sendMessage", params)
 
     def get_comments(self, message_id):
         params = {
             "userID": self.id,
-            "messageID": message_id
+            "messageID": message_id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-            
-        return self.parse_comments(self.get("getComments.php", params).text, message_id)
-        
+
+        return self.parse_comments(self.get("getComments", params).text, message_id)
+
     def post_comment(self, message_id, comment):
         params = {
             "userID": self.id,
             "messageID": message_id,
             "comment": comment,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get("postComment.php", params)
-    
-    def peek(self, location):
+        return self.post("postComment", params)
+
+    def get_peek_locations(self):
         params = {
             "userID": self.id,
-            "lat": location.latitude,
-            "long": location.longitude,
-            "delta": location.delta,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
         }
-        return self.get_yak_list("getPeekMessages.php", params)
-    
-    def register_id(self):
-        result = self.get("registerUserDroid.php", {})
-        return result.text
+        data = self.get("getMessages", params).json()
+        peeks = []
+        for peek_json in data['otherLocations']:
+            peeks.append(PeekLocation(peek_json))
+        return peeks
+
+    def get_featured_locations(self):
+        params = {
+            "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
+        }
+        data = self.get("getMessages", params).json()
+        peeks = []
+        for peek_json in data['featuredLocations']:
+            peeks.append(PeekLocation(peek_json))
+        return peeks
+
+    def get_yakarma(self):
+        params = {
+            "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
+        }
+        data = self.get("getMessages", params).json()
+        return int(data['yakarma'])
+
+    def peek(self, peek_id):
+        if isinstance(peek_id, PeekLocation):
+            peek_id = peek_id.id
+
+        params = {
+            "userID": self.id,
+            "lat": self.location.latitude,
+            "long": self.location.longitude,
+            'peekID': peek_id,
+        }
+        return self.get_yak_list("getPeekMessages", params)
+
